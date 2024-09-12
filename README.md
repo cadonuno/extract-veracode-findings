@@ -1,6 +1,6 @@
 Gets count of ALL findings for all available application profiles. Also includes latest scan names and dates.
 
-*Note*: This script requires Python 3!
+*Note*: This script requires Python 3.10!
 
 ## Setup
 
