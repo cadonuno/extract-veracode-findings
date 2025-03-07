@@ -1,3 +1,5 @@
+# Credit to Ricardo P for this script
+
 import sys
 import requests
 import argparse
@@ -17,6 +19,8 @@ xml_header = {
     "User-Agent": "Bulk application creation - python script",
     "Content-Type": "application/xml"
 }
+
+owasp_cache = {}
 
 def print_help():
     print("""extractfindings.py -t <target_file(.csv)> [-d] [-s] [-d]
@@ -57,13 +61,14 @@ def get_all_applications(rest_api_base, page, verbose):
 
     response = requests.get(path, auth=RequestsAuthPluginVeracodeHMAC(), headers=json_header)
 
-    body = response.json()
     if verbose:
         print(f"status code {response.status_code}")
-        if body:
-            print(body)
+        
     if response.status_code == 200:
         print(f"Successfully obtained applications page {page}")
+        body = response.json()
+        if verbose and body:
+            print(body)
         if "_embedded" in body and "applications" in body["_embedded"]:
             applications = body["_embedded"]["applications"]
             if has_more_pages(body):
@@ -137,6 +142,52 @@ def get_latest_scan_name(xml_api_base, application, verbose):
         print(f"Unable to obtain application information: {response.status_code}")
         return ""
 
+def call_owasp_api(cwe_node, cwe_id, verbose):
+    print(f"Getting OWASP info for CWE-{cwe_id}")
+    path = cwe_node["href"]
+
+    if verbose:
+        print(f"Calling API at {path}")
+
+    response = requests.get(path, auth=RequestsAuthPluginVeracodeHMAC(), headers=json_header)
+
+    
+    if verbose:
+        print(f"status code {response.status_code}")
+
+    if response.status_code == 200:
+        body = response.json()
+        if verbose and body:
+            print(body)
+        if "references" in body:
+            references = body["references"]
+            for reference in references:
+                if reference["name"] == "OWASP":
+                    return True
+        return False
+    elif response.status_code == 429:
+        handle_throttling()
+        return call_owasp_api(cwe_node, cwe_id, verbose)
+    else:
+        print(f"Unable to obtain OWASP info for CWE-{cwe_id}: {response.status_code}")
+        return None
+
+def is_owasp_flaw(finding_details, verbose):
+    global owasp_cache
+    if not "cwe" in finding_details or not "id" in finding_details["cwe"]:
+        return False
+    cwe_id = finding_details["cwe"]["id"]
+    if cwe_id in owasp_cache:
+        return owasp_cache[cwe_id]
+
+    owasp_info = call_owasp_api(finding_details["cwe"], cwe_id, verbose)
+
+    if owasp_info == None:
+        return False
+    
+    owasp_cache[cwe_id] = owasp_info
+    return owasp_info
+
 def get_findings_totals(application, rest_api_base, scan_type, verbose):
     findings = get_findings_for_app_and_scan_type(application, 0, rest_api_base, scan_type, verbose)
     findings_totals = {
@@ -155,6 +206,14 @@ def get_findings_totals(application, rest_api_base, scan_type, verbose):
             "low": 0,
             "very_low": 0,
             "informational": 0
+        },
+        "relative": {
+            "new": 0,
+            "old": 0,
+            "reopened": 0,
+            "mitigated": 0,
+            "owasp": 0,
+            "policy": 0
         }
     }
 
@@ -175,6 +234,17 @@ def get_findings_totals(application, rest_api_base, scan_type, verbose):
             case 0:
                 severity = 'informational'
         findings_totals[open_or_closed][severity] += 1
+        if finding['finding_status']["new"]:
+            findings_totals["relative"]["new"] += 1
+        else:
+            findings_totals["relative"]["old"] += 1
+        #TODO: add reopened
+        if finding['finding_status']["resolution"] == "MITIGATED":
+            findings_totals["relative"]["mitigated"] += 1
+        if is_owasp_flaw(finding['finding_details'], verbose):
+            findings_totals["relative"]["owasp"] += 1
+        if finding['violates_policy']:
+            findings_totals["relative"]["policy"] += 1
 
     return findings_totals
 
@@ -206,8 +276,7 @@ def get_application_results(application, rest_api_base, xml_api_base, custom_fie
     results = {
         'Application Name': application["profile"]["name"],
         'Application ID': application["id"],
-        'Application GUID': application["guid"],
-
+        'Application GUID': application["guid"]
     }
 
     if custom_field_list and "custom_fields" in application["profile"]:
@@ -239,7 +308,15 @@ def get_application_results(application, rest_api_base, xml_api_base, custom_fie
             'SAST - Low Findings (Closed)': sast_totals["open"]["low"],
             'SAST - Very Low Findings (Closed)': sast_totals["open"]["very_low"],
             'SAST - Informational Findings (Closed)': sast_totals["open"]["informational"], 
+
+            'SAST - New Findings': sast_totals["relative"]["new"], 
+            'SAST - Old Findings': sast_totals["relative"]["old"], 
+            'SAST - Reopened Findings': sast_totals["relative"]["reopened"], 
+            'SAST - Mitigated Findings': sast_totals["relative"]["mitigated"], 
+            'SAST - OWASP Findings': sast_totals["relative"]["owasp"], 
+            'SAST - Policy Impacting Findings': sast_totals["relative"]["policy"], 
         })
+
     if is_dast:
         results.update({
             'DAST - Very High Findings (Open)': dast_totals["open"]["very_high"],
@@ -254,7 +331,14 @@ def get_application_results(application, rest_api_base, xml_api_base, custom_fie
             'DAST - Medium Findings (Closed)': dast_totals["open"]["medium"],
             'DAST - Low Findings (Closed)': dast_totals["open"]["low"],
             'DAST - Very Low Findings (Closed)': dast_totals["open"]["very_low"],
-            'DAST - Informational Findings (Closed)': dast_totals["open"]["informational"]   
+            'DAST - Informational Findings (Closed)': dast_totals["open"]["informational"], 
+
+            'DAST - New Findings': dast_totals["relative"]["new"], 
+            'DAST - Old Findings': dast_totals["relative"]["old"], 
+            'DAST - Reopened Findings': dast_totals["relative"]["reopened"], 
+            'DAST - Mitigated Findings': dast_totals["relative"]["mitigated"], 
+            'DAST - OWASP Findings': dast_totals["relative"]["owasp"], 
+            'DAST - Policy Impacting Findings': dast_totals["relative"]["policy"],   
         })
     if is_sca:
         results.update({
@@ -270,7 +354,14 @@ def get_application_results(application, rest_api_base, xml_api_base, custom_fie
             'SCA - Medium Findings (Closed)': sca_totals["open"]["medium"],
             'SCA - Low Findings (Closed)': sca_totals["open"]["low"],
             'SCA - Very Low Findings (Closed)': sca_totals["open"]["very_low"],
-            'SCA - Informational Findings (Closed)': sca_totals["open"]["informational"]   
+            'SCA - Informational Findings (Closed)': sca_totals["open"]["informational"], 
+
+            'SCA - New Findings': sca_totals["relative"]["new"], 
+            'SCA - Old Findings': sca_totals["relative"]["old"], 
+            'SCA - Reopened Findings': sca_totals["relative"]["reopened"], 
+            'SCA - Mitigated Findings': sca_totals["relative"]["mitigated"], 
+            'SCA - OWASP Findings': sca_totals["relative"]["owasp"], 
+            'SCA - Policy Impacting Findings': sca_totals["relative"]["policy"],  
         })
 
     return results
