@@ -1,5 +1,3 @@
-# Credit to Ricardo P for this script
-
 import sys
 import requests
 import argparse
